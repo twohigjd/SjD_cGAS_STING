@@ -1,0 +1,353 @@
+---
+title: "STING Pathway in Sjogren's Disease, figure 1 code"
+author: "Joseph Twohig"
+output:
+  html_document:
+    toc: true
+    toc-location: left
+  pdf_document:
+    toc: true
+---
+
+```{r message=FALSE, warning=FALSE, results = FALSE}
+library(readxl)
+library(tidyverse) 
+library(edgeR) # DGE testing
+library(DESeq2) # DGE testing
+library(clusterProfiler) # GO
+library(AnnotationDbi) # GO
+library(patchwork) # Plotting
+library(gridExtra) # Plotting
+library(ggrepel) # Plotting
+library(GSVA) # Performing GSVA
+library(msigdbr) # Pulling gene sets
+library(ComplexHeatmap) # For heatmaps
+library(org.Hs.eg.db) # Get gene mapping
+library(circlize)  # For color functions
+library(dendextend)  # For dendrogram manipulation
+library(scales) # Color scales
+library(ggpubr) # Stat tests
+
+setwd("/data/Warner_Lab/bulk_sting_analysis")
+```
+
+Load in expression matrices and metadata
+
+```{r}
+metadata <- read.csv("metadata.csv")
+metadata$SSA <- case_when(
+  grepl("1", metadata$SSA) ~ "Positive",
+  grepl("0", metadata$SSA) ~ "Negative",
+  TRUE ~ NA_character_
+)
+metadata$SSB <- case_when(
+  grepl("1", metadata$SSB) ~ "Positive",
+  grepl("0", metadata$SSB) ~ "Negative",
+  TRUE ~ NA_character_
+)
+
+gland <- read.delim("/data/Warner_Lab/STING_BulkRNA_SjD_HV_nonSjD/MSG_with_corrected_sample_names/report/RawCountFile_filtered.txt",row.names=1,check.names=FALSE)%>% 
+  dplyr::select(metadata$MSG_Samples)
+
+blood <- read.delim("/data/Warner_Lab/STING_BulkRNA_SjD_HV_nonSjD/Blood_with_corrected_sample_names/report/RawCountFile_filtered.txt",row.names=1,check.names=FALSE) %>%
+  dplyr::select(metadata$Blood_Samples)
+```
+
+Convert the Ensembl IDs in the counts matrices to gene symbols
+
+```{r message=FALSE, warning=FALSE}
+# Make function to convert and filter for gene symbols
+ens_to_symbol <- function(matrix) {
+  ens <- rownames(matrix)
+  symbols <- mapIds(org.Hs.eg.db, keys = ens,
+                    column = c('SYMBOL'), keytype = 'ENSEMBL')
+  symbols <- symbols[!is.na(symbols)]
+  symbols <- symbols[!duplicated(symbols)]
+  symbols <- symbols[match(rownames(matrix), names(symbols))]
+  symbols <- symbols[!is.na(symbols)]
+  matrix <- matrix[names(symbols), ]
+  rownames(matrix) <- symbols
+  return(matrix)
+}
+
+# Convert gland and blood count matrices
+gland <- ens_to_symbol(gland)
+blood <- ens_to_symbol(blood)
+```
+
+# 1b: Supervised, expression-based hierarchical clustering
+
+Take the top variable genes and cluster samples based on expression. Then
+map the dendrogram onto the metadata and visualize. 
+
+```{r}
+# Prepare metadata subset and factor levels
+metadata_subset <- metadata %>%
+  dplyr::select(Age, Sex, condition, SSA, SSB, Focus.Score, RF, ANA,
+         RACE, Type.I.IFN.Bioassay.AVG, WUS, WSSF) %>%
+  mutate(
+    Focus.Score = case_when(
+      Focus.Score == 0 ~ "None (0)",
+      Focus.Score == 1 ~ "Low (1)",
+      Focus.Score >= 2 & Focus.Score < 4 ~ "Medium (2-3)",
+      Focus.Score >= 4 ~ "High (≥4)"
+    ),
+    Focus.Score = factor(Focus.Score, levels = c("None (0)", "Low (1)", "Medium (2-3)", "High (≥4)")),
+    across(c(Sex, condition, SSA, SSB, RACE), as.factor)
+  )
+
+# Filter metadata to plot
+# metadata_for_clustering <- metadata_subset %>% dplyr::select(-SPIT_number, -ESSDAI)
+
+# Split metadata by condition
+metadata_split <- split(metadata_subset, metadata_subset$condition)
+
+# Normalize expression and select top 300 variable genes ---
+norm_gland <- log2(gland + 1)
+top_genes <- norm_gland %>%
+  apply(1, var) %>%
+  sort(decreasing = TRUE) %>%
+  head(300) %>%
+  names()
+top_expr <- norm_gland[top_genes, ]
+
+# Functions
+create_color_scale <- function(values, colors) {
+  values <- na.omit(values)
+  if (length(unique(values)) > 1) {
+    colorRamp2(c(min(values), max(values)), colors)
+  } else if (length(unique(values)) == 1) {
+    colorRamp2(c(values[1] - 0.1, values[1] + 0.1), colors)
+  } else {
+    colorRamp2(c(0, 1), colors)
+  }
+}
+
+make_dendrogram <- function(condition) {
+  samples <- metadata %>% filter(condition == !!condition) %>% pull(MSG_Samples)
+  expr <- top_expr[, samples, drop = FALSE]
+  hclust(dist(t(expr))) %>% as.dendrogram()
+}
+
+make_annotation <- function(meta) {
+  HeatmapAnnotation(
+    show_annotation_name = FALSE,
+    Age = meta$Age,
+    Sex = meta$Sex,
+    Condition = meta$condition,
+    FS = meta$Focus.Score,
+    SSA = meta$SSA,
+    SSB = meta$SSB,
+    ESSDAI = meta$ESSDAI,
+    WUS = meta$WUS,
+    WSSF = meta$WSSF,
+    RACE = meta$RACE,
+    col = list(
+      Age = create_color_scale(meta$Age, c("yellow", "orange")),
+      Sex = c("FEMALE" = "pink", "MALE" = "lightblue"),
+      Condition = c("SjD" = "red", "nonSjD" = "grey", "HV" = "blue"),
+      FS = c("High (≥4)" = "#7f03fc", "Medium (2-3)" = "#524fff", "Low (1)" = "#7e9cf7", "None (0)" = "#b3cff5"),
+      SSA = c("Positive" = "darkred", "Negative" = "white"),
+      SSB = c("Positive" = "darkblue", "Negative" = "white"),
+      ESSDAI = create_color_scale(meta$ESSDAI, c("green", "darkgreen")),
+      WUS = create_color_scale(meta$WUS, c("white", "turquoise")),
+      WSSF = create_color_scale(meta$WSSF, c("white", "springgreen")),
+      RACE = c(
+        "BLACK OR AFRICAN AMERICAN" = "purple",
+        "ASIAN" = "orange",
+        "WHITE" = "cyan",
+        "MULTIPLE RACES" = "brown",
+        "UNKNOWN" = "grey"
+      )
+    )
+  )
+}
+
+make_heatmap <- function(n_col, dend, annotation) {
+  Heatmap(
+    matrix(nc = n_col, nr = 0),
+    cluster_columns = dend,
+    show_row_dend = FALSE,
+    show_column_dend = TRUE,
+    column_names_gp = gpar(fontsize = 10),
+    top_annotation = annotation,
+    show_heatmap_legend = FALSE
+  )
+}
+
+# Create heatmaps
+heatmap_SjD <- make_heatmap(nrow(metadata_split$SjD),make_dendrogram("SjD"),make_annotation(metadata_split$SjD))
+heatmap_nonSjD <- make_heatmap(nrow(metadata_split$nonSjD),make_dendrogram("nonSjD"),make_annotation(metadata_split$nonSjD))
+heatmap_HV <- make_heatmap(nrow(metadata_split$HV),make_dendrogram("HV"),make_annotation(metadata_split$HV))
+
+combined_heatmap <- heatmap_SjD + heatmap_nonSjD + heatmap_HV
+
+# Plot and save
+draw(combined_heatmap, annotation_legend_side = "bottom")
+
+# svg("figure1/metaHeatmapExpressionSupervised.svg", width = 12, height = 4)
+# draw(combined_heatmap, annotation_legend_side = "bottom")
+# dev.off()
+# 
+# png("figure1/metaHeatmapExpressionSupervised.png", width = 12, height = 4, units = "in", res = 300)
+# draw(combined_heatmap, annotation_legend_side = "bottom")
+# dev.off()
+```
+
+
+# 1c,d: Principal Component Analysis (PCA)
+
+```{r message=FALSE, warning=FALSE}
+# Plot function
+pcaplot <- function(matrix, tissue_title, ellipse = TRUE, ellipse.prob = 0.8) {
+  ddsHTSeq <- DESeqDataSetFromMatrix(countData = matrix, colData = metadata['condition'], design = ~condition)
+  dds <- DESeq(ddsHTSeq)
+  rlt <- varianceStabilizingTransformation(dds, blind = FALSE)
+  vsd_matrix <- assay(rlt)
+  # Select variable genes
+  top500_genes <- head(order(rowVars(vsd_matrix), decreasing = TRUE), 500)
+  top500_matrix <- vsd_matrix[top500_genes, ]
+  pca_results <- prcomp(t(top500_matrix), scale. = TRUE)
+  percentVar <- pca_results$sdev^2 / sum(pca_results$sdev^2)
+  pca_data <- as.data.frame(pca_results$x)
+  pca_data$condition <- metadata$condition
+  g <- ggplot(pca_data, aes(x = PC1, y = PC2, color = condition)) +
+    geom_point(size = 3) +
+    scale_color_manual(values = c("SjD" = "red", "nonSjD" = "grey", "HV" = "blue")) +
+    labs(
+      title = paste0("PCA of ", tissue_title),
+      x = paste0("PC1, Variance Explained: ", round(percentVar[1] * 100, digits = 2), "%"),
+      y = paste0("PC2, Variance Explained: ", round(percentVar[2] * 100, digits = 2), "%")
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text = element_text(size = 10),
+      axis.title = element_text(size = 10),
+      plot.title = element_text(size = 12),
+      legend.position = "right"
+    )
+  # Add ellipse by condition
+  if (ellipse) {
+    g <- g + stat_ellipse(aes(fill = condition), alpha = 0.2, level = ellipse.prob, geom = "polygon") +
+      scale_fill_manual(values = c("SjD" = "red", "nonSjD" = "grey", "HV" = "blue"))
+  }
+  return(g)
+}
+
+msgpca <- pcaplot(gland, "Minor Salivary Gland Samples")
+msgpca
+
+# ggsave(file="figure1/glandPca.svg", plot=msgpca, width=5, height=3)
+
+bloodpca <- pcaplot(blood, "Blood Samples")
+bloodpca
+
+# ggsave(file="figure1/bloodPca.svg", plot=bloodpca, width=5, height=3)
+```
+
+# 1e: Gene Ontology (GO) analysis
+
+```{r message=FALSE, warning=FALSE}
+# Reformat metadata to make single comparison
+metadata$disease <- case_when(
+  grepl("nonSjD", metadata$condition) ~ "nonSjD/HV",
+  grepl("HV", metadata$condition) ~ "nonSjD/HV",
+  TRUE ~ "SjD"
+)
+
+condition <- factor(metadata$disease[match(colnames(gland), metadata$MSG_Samples)])
+coldata <- data.frame(row.names = colnames(gland), condition)
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = gland, colData = coldata, design = ~condition)
+dds <- DESeq(dds)
+
+# Get differential expression results (SjD vs nonSjD/HV)
+res <- results(dds, contrast = c("condition", "SjD", "nonSjD/HV"))
+
+# Filter significant DEGs
+sigs <- na.omit(res)
+sigs <- sigs[sigs$padj < 0.05 & sigs$baseMean > 50, ]
+
+# Select upregulated genes (log2FC > 0.5)
+genes_to_test <- rownames(sigs[sigs$log2FoldChange > 0.5, ])
+
+# Perform GO enrichment analysis (Biological Process)
+GO_results <- enrichGO(gene = genes_to_test, OrgDb = org.Hs.eg.db, keyType = "SYMBOL", ont = "BP")
+
+# Generate barplot
+plot <- barplot(GO_results, showCategory = 8, main = "GO Enrichment MSG SjD vs nonSjD/HV")
+plot
+
+# ggsave(file="figure1/glandGObarplot.svg", plot=plot, width=8, height=8)
+```
+
+# 1f: Gene Set Variation Analysis (GSVA)
+
+```{r message=FALSE, warning=FALSE}
+# Retrieve pathway data from msigdbr, filtering relevant pathways
+pathways <- rbind(msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_LEGACY") %>% 
+  filter(gs_name %in% c("KEGG_CYTOSOLIC_DNA_SENSING_PATHWAY", "KEGG_RIG_I_LIKE_RECEPTOR_SIGNALING_PATHWAY")))
+
+# Create gene set for GSVA input
+gene_sets <- split(pathways,
+                   pathways$gs_name) %>% 
+  lapply(`[[`,
+         "gene_symbol")
+gene_sets$IFN_Type_I_28genes <- c("CXCL10","DDX60","EPSTI1","GBP1","HERC5",
+                        "HERC6","IFI27","IFI44","IFI44L","IFI6",
+                        "IFIT1","IFIT2","IFIT3","IFIT5","ISG15",
+                        "LAMP3","LY6E","MX1","OAS1","OAS2",
+                        "OAS3","OASL","RSAD2","RTP4","SIGLEC1",
+                        "SOCS1","SPATS2L","USP18")
+gene_sets$IFN_Type_II_8genes <- c("FCGR1A","CXCL9","IFI30","CIITA","SERPING1",
+                        "IRF1","CXCL10","GBP8")
+
+# Normalize counts data matrices before running GSVA
+norm_gland <- cpm(gland, log = T)
+gsva_gland <- gsva(gsvaParam(exprData = norm_gland, geneSets = gene_sets))
+gland_heat <- gsva_gland
+rownames(gland_heat) <- c("DNA Sensing", "RNA Sensing","28 gene Type I IFN", "8 gene Type II IFN")
+
+# Creating a dataframe with GSVA results and metadata to use in visualization
+targets <- metadata %>% 
+  dplyr::select("SPIT_number", "condition")
+
+# Heatmap annotation
+col_condition <- c("SjD" = "red", "nonSjD" = "grey", "HV" = "blue")
+
+# Construct heatmap
+glandGSVAHeatmap <- Heatmap(
+  gland_heat,
+  column_title = "Minor Salivary Gland GSVA Heatmap",
+  name = "Expression",
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  row_names_gp = gpar(fontsize = 10),
+  column_names_gp = gpar(fontsize = 10),
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 12),
+    at = seq(-2, 2, length.out = 5)
+  ),
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  top_annotation = HeatmapAnnotation(
+    Condition = targets$condition,
+    col = list(
+      Condition = col_condition
+    ),
+    annotation_legend_param = list(
+      title_gp = gpar(fontsize = 12)
+    )
+  )
+)
+
+glandGSVAHeatmap
+
+# svg(file="figure1/glandGSVAHeatmap.svg", width=8, height=5.5)
+# draw(glandGSVAHeatmap)
+# dev.off()
+# png(file="figure1/glandGSVAHeatmap.png", width=7, height=5.5, units = "in", res = 500)
+# draw(glandGSVAHeatmap)
+# dev.off()
+```
