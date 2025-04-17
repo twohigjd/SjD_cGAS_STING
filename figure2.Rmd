@@ -1,0 +1,342 @@
+---
+title: "STING Pathway in Sjogren's Disease, figure 2 code"
+author: "Joseph Twohig"
+output:
+  html_document:
+    toc: true
+    toc-location: left
+  pdf_document:
+    toc: true
+---
+
+```{r message=FALSE, warning=FALSE, results = FALSE}
+library(readxl)
+library(tidyverse) 
+library(edgeR) # Preparing counts data
+library(GSVA) # Performing GSVA
+library(msigdbr) # Pulling gene sets
+library(org.Hs.eg.db) # Get gene mapping
+library(ggpubr) # Stat tests
+
+setwd("/data/Warner_Lab/bulk_sting_analysis")
+```
+
+Load in expression matrices and metadata
+
+```{r}
+metadata <- read.csv("metadata.csv")
+metadata$SSA <- case_when(
+  grepl("1", metadata$SSA) ~ "Positive",
+  grepl("0", metadata$SSA) ~ "Negative",
+  TRUE ~ NA_character_
+)
+metadata$SSB <- case_when(
+  grepl("1", metadata$SSB) ~ "Positive",
+  grepl("0", metadata$SSB) ~ "Negative",
+  TRUE ~ NA_character_
+)
+
+gland <- read.delim("/data/Warner_Lab/STING_BulkRNA_SjD_HV_nonSjD/MSG_with_corrected_sample_names/report/RawCountFile_filtered.txt",row.names=1,check.names=FALSE)%>% 
+  dplyr::select(metadata$MSG_Samples)
+
+blood <- read.delim("/data/Warner_Lab/STING_BulkRNA_SjD_HV_nonSjD/Blood_with_corrected_sample_names/report/RawCountFile_filtered.txt",row.names=1,check.names=FALSE) %>%
+  dplyr::select(metadata$Blood_Samples)
+```
+
+Convert the Ensembl IDs in the counts matrices to gene symbols
+
+```{r message=FALSE, warning=FALSE}
+# Make function to convert and filter for gene symbols
+ens_to_symbol <- function(matrix) {
+  ens <- rownames(matrix)
+  symbols <- mapIds(org.Hs.eg.db, keys = ens,
+                    column = c('SYMBOL'), keytype = 'ENSEMBL')
+  symbols <- symbols[!is.na(symbols)]
+  symbols <- symbols[!duplicated(symbols)]
+  symbols <- symbols[match(rownames(matrix), names(symbols))]
+  symbols <- symbols[!is.na(symbols)]
+  matrix <- matrix[names(symbols), ]
+  rownames(matrix) <- symbols
+  return(matrix)
+}
+
+# Convert gland and blood count matrices
+gland <- ens_to_symbol(gland)
+blood <- ens_to_symbol(blood)
+```
+
+# 2a: Expression dot plot
+
+```{r message=FALSE, warning=FALSE}
+goiDotPlotWithSignificance <- function(matrix, goi_list, tissue_type) {
+  if (tissue_type == "gland") {
+    var_name = "MSG_Samples"
+    plot_title = "Minor Salivary Gland"
+  } else {
+    var_name = "Blood_Samples"
+    plot_title = "Blood"
+  }
+  
+  # Normalize gene expression (CPM)
+  goi_mat <- as.data.frame(cpm(matrix))
+  goi_mat <- goi_mat %>% 
+    filter(row.names(goi_mat) %in% goi_list) %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    rownames_to_column(var = var_name)
+  
+  # Merge with metadata
+  goi_mat <- merge(goi_mat, metadata, by = var_name)
+  
+  # Reshape to long format
+  goi_long <- goi_mat %>%
+    pivot_longer(cols = all_of(goi_list), names_to = "gene", values_to = "expression")
+  
+  # Add z-scores
+  goi_long <- goi_long %>%
+    group_by(gene) %>%
+    mutate(z_score = scale(expression)) %>%
+    ungroup()
+  
+  # Order genes
+  goi_long$gene <- factor(goi_long$gene, levels = goi_list)
+  
+  # Compute % expressed and avg z-score
+  summary_data <- goi_long %>%
+    mutate(is_expressed = expression > 0) %>%
+    group_by(condition, gene) %>%
+    summarize(
+      percent_expressed = 100 * mean(is_expressed),
+      average_expression = mean(z_score, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # ==== Significance Testing ====
+  # Wilcoxon test for each gene
+  stat_results <- goi_long %>%
+    filter(condition %in% c("SjD", "HV")) %>%
+    group_by(gene) %>%
+    summarise(
+      p_value = wilcox.test(expression ~ condition)$p.value,
+      .groups = "drop"
+    ) %>%
+    mutate(significance = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01 ~ "**",
+      p_value < 0.05 ~ "*",
+      TRUE ~ ""
+    ))
+
+  # Merge for plotting
+  summary_data <- left_join(summary_data, stat_results, by = "gene")
+
+  # Plot
+  g <- ggplot(summary_data, aes(x = gene, y = condition)) +
+    geom_point(aes(size = percent_expressed, color = average_expression)) +
+    scale_size_continuous(name = "Percent Expression", range = c(1, 10)) +
+    scale_color_gradient2(name = "Normalized Expression", low = "blue", mid = "white", high = "red", midpoint = 0) +
+    geom_text(
+      data = stat_results,
+      aes(x = gene, y = 3.3, label = significance), # assuming only two groups: HV and SjD
+      inherit.aes = FALSE,
+      size = 5
+    ) +
+    theme_minimal() +
+    labs(
+      title = paste0(plot_title, " Normalized Gene Expression by Disease State"),
+      x = "Gene", y = "Condition"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.title = element_text(size = 12),
+      plot.title = element_text(size = 14)
+    )
+
+  return(g)
+}
+
+# Genes of interest
+goi <- c("STING1","CGAS", # Core genes
+         "TBK1","IRF3","IKBKE", # Downstream signaling
+         "STAT1","STAT2","IRF7", # Type I IFN response
+         "MX1","ISG15","OAS1","OAS2","OAS3","IFIH1", # Feedback/Effectors
+         "USP18","SOCS1","SOCS3", # Negative regulators
+         "IL6","TNF","CXCL8","CXCL10" # Cytokines
+         )
+
+msggoi_sig <- goiDotPlotWithSignificance(matrix = gland, goi_list = goi, tissue_type = "gland")
+msggoi_sig
+
+# ggsave(file="figure2/glandGoiDotplotSignificance.svg", plot=msggoi_sig, width=8.5, height=4.5)
+```
+
+# 2b,c.d: GSVA correlation plots
+
+Prepare data frame for plotting
+
+```{r message=FALSE, warning=FALSE}
+# Retrieve pathway data from msigdbr, filtering relevant pathways
+pathways <- rbind(msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_LEGACY") %>% 
+  filter(gs_name %in% c("KEGG_CYTOSOLIC_DNA_SENSING_PATHWAY", "KEGG_RIG_I_LIKE_RECEPTOR_SIGNALING_PATHWAY")))
+
+# Create gene set for GSVA input
+gene_sets <- split(pathways,
+                   pathways$gs_name) %>% 
+  lapply(`[[`,
+         "gene_symbol")
+gene_sets$IFN_Type_I_28genes <- c("CXCL10","DDX60","EPSTI1","GBP1","HERC5",
+                        "HERC6","IFI27","IFI44","IFI44L","IFI6",
+                        "IFIT1","IFIT2","IFIT3","IFIT5","ISG15",
+                        "LAMP3","LY6E","MX1","OAS1","OAS2",
+                        "OAS3","OASL","RSAD2","RTP4","SIGLEC1",
+                        "SOCS1","SPATS2L","USP18")
+gene_sets$IFN_Type_II_8genes <- c("FCGR1A","CXCL9","IFI30","CIITA","SERPING1",
+                        "IRF1","CXCL10","GBP8")
+
+# Normalize counts data matrices before running GSVA
+norm_gland <- cpm(gland, log = T)
+gsva_gland <- gsva(gsvaParam(exprData = norm_gland, geneSets = gene_sets))
+gsva_gland_t <- as.data.frame(t(gsva_gland))
+gsva_gland_t$Sample <- rownames(gsva_gland_t)
+
+# Creating a dataframe with all GSVA results and metadata to use in visualization
+targets <- metadata %>% 
+  dplyr::select("SPIT_number","MSG_Samples","condition","SSA","Type.I.IFN.Bioassay.AVG") %>% 
+  rename(MSG_Samples = "Sample")
+
+merged_data <- merge(gsva_gland_t, targets, by = "Sample")
+
+scatterplot <- function(df, x_var, y_var, col, shape_, x_title, y_title, col_title, shape_title = NULL, title_, facet.by, legend_pos) {
+  plot <- ggplot(df %>%
+                   filter(!is.na({{ y_var }})),
+                 aes(x = {{ x_var }}, y = {{ y_var }}, color = {{ col }})) +
+    geom_point(aes(shape = {{ shape_ }}), size = 3) + 
+    geom_smooth(method = "lm", se = FALSE, formula = 'y ~ x') +  # Add a line of best fit
+    labs(x = x_title,
+         y = y_title,
+         title = title_,
+         color = col_title, 
+         shape = shape_title) +
+    scale_color_manual(values = c("SjD" = "red", "nonSjD" = "grey", "HV" = "blue")) +  # Set custom colors
+    theme_minimal() +
+    theme(legend.position = legend_pos) +
+    theme(axis.text = element_text(size = 10),
+          axis.title = element_text(size = 10),
+          plot.title = element_text(size = 12)) +
+    stat_cor(method = "pearson", size = 4, color = "black") +
+    facet_wrap(vars({{ facet.by }}), scales = 'fixed')
+  return(plot)
+}
+```
+
+Plot
+
+```{r}
+dna_vs_type1 <- scatterplot(df = merged_data %>% dplyr::filter(condition == "SjD"),
+           x_var = KEGG_CYTOSOLIC_DNA_SENSING_PATHWAY,
+           y_var = IFN_Type_I_28genes,
+           col = condition,
+           # shape_ = SSA,
+           x_title = "DNA Sensing Pathway Score",
+           y_title = "Type I IFN 28 Gene Panel Score",
+           title_ = "Gland: DNA sensing vs Type I IFN",
+           col_title = NULL,
+           # shape_title = "SSA",
+           facet.by = condition,
+           legend_pos = "right")
+
+dna_vs_type1
+# ggsave(file="figure2/glandDNAvsT1.svg", plot=dna_vs_type1, width=2.83333333333, height=3)
+
+dna_vs_type2 <- scatterplot(df = merged_data %>% dplyr::filter(condition == "SjD"),
+           x_var = KEGG_CYTOSOLIC_DNA_SENSING_PATHWAY,
+           y_var = IFN_Type_II_8genes,
+           col = condition,
+           # shape_ = SSA,
+           x_title = "DNA Sensing Pathway Score",
+           y_title = "Type II IFN 8 Gene Panel Score",
+           title_ = "Gland: DNA sensing vs Type II IFN",
+           col_title = NULL,
+           # shape_title = "SSA",
+           facet.by = condition,
+           legend_pos = "right")
+
+dna_vs_type2
+# ggsave(file="figure2/glandDNAvsT2.svg", plot=dna_vs_type2, width=2.83333333333, height=3)
+
+dna_vs_bioassay <- scatterplot(df = merged_data %>% dplyr::filter(condition == "SjD"),
+           x_var = KEGG_CYTOSOLIC_DNA_SENSING_PATHWAY,
+           y_var = Type.I.IFN.Bioassay.AVG,
+           col = condition,
+           # shape_ = SSA,
+           x_title = "DNA Sensing Pathway Score",
+           y_title = "IFN Bioassay Score",
+           title_ = "Gland: DNA sensing vs IFN Bioassay",
+           col_title = NULL,
+           # shape_title = "SSA",
+           facet.by = condition,
+           legend_pos = "right")
+
+dna_vs_bioassay
+# ggsave(file="figure2/glandDNAvsIFNBioassay", plot=dna_vs_bioassay, width=2.83333333333, height=3)
+```
+
+# 2e: Deconvolution, CD8 GZMK+ T cell proportions
+
+This data was generated from deconvolution.R
+
+```{r message=FALSE, warning=FALSE}
+# Read in the deconvoluted proportion data
+metadata$SPIT_number <- as.character(metadata$SPIT_number)
+deconv_gland <- readRDS("deconv_celltypes_gland.RDS") %>% 
+  rownames_to_column(var = "Cell_Type") %>%
+  pivot_longer(-Cell_Type, names_to = "SPIT_number", values_to = "Proportion") %>%
+  left_join(metadata, by = "SPIT_number")
+
+# Plot subset
+deconvGlandGZMKT <- ggplot(deconv_gland %>% filter(Cell_Type %in% c("CD8 GZMK+ T")), 
+                                aes(x = condition, y = Proportion, fill = condition)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +  # Boxplot without outliers
+  geom_jitter(aes(color = condition), width = 0.2, size = 1.5, alpha = 0.8) +  # Jittered points
+  stat_compare_means(comparisons = list(c("SjD", "nonSjD"), c("SjD", "HV"), c("nonSjD", "HV")),
+                     method = "t.test", label = "p.signif") +
+  scale_fill_manual(values = c("SjD" = "red", "nonSjD" = "grey", "HV" = "blue")) +
+  scale_color_manual(values = c("SjD" = "red", "nonSjD" = "grey", "HV" = "blue")) +
+  facet_wrap(~Cell_Type, scales = "free_y", ncol = 4) +  # Facet by Cell Type
+  theme_minimal() +
+  theme(
+    strip.text = element_text(size = 9, face = "bold"),  # Cell type labels as titles
+    axis.text.x = element_blank(),  # Remove x-axis labels
+    axis.ticks.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    legend.position = "bottom"
+  )
+
+deconvGlandGZMKT
+# ggsave("figure2/deconvGlandGZMKT.svg", deconvGlandGZMKT, width = 4, height = 3)
+```
+
+# 2f: Deconvolution correlation with GSVA score
+
+```{r message=FALSE, warning=FALSE}
+merged <- merge(merged_data,deconv_gland,
+                       by = "SPIT_number")
+
+dna_vs_proportions <- scatterplot(df = merged %>% 
+              dplyr::filter(Cell_Type == "CD8 GZMK+ T"),
+            x_var = Proportion,
+            y_var = KEGG_CYTOSOLIC_DNA_SENSING_PATHWAY,
+            col = condition.x,
+            # shape_ = SSA,
+            x_title = "Proportion of CD8 GZMK+ T Cells",
+            y_title = "DNA Sensing Score",
+            title_ = "DNA Sensing Score by CD8 GZMK+ T Cell Proportion",
+            col_title = NULL,
+            shape_title = NULL,
+            facet.by = condition.x,
+            legend_pos = "right")
+
+dna_vs_proportions
+# ggsave(file="figure2/dna_vs_proportions.svg", plot=dna_vs_proportions, width=4.5, height=3)
+```
